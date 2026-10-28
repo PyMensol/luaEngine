@@ -404,6 +404,14 @@ cm.on("cursorActivity", function() {
     }
 });
 cm.on("change", function() { if (bridge && !suppressDirty) bridge.docChanged(); });
+cm.on("inputRead", function(ed, ev) {
+    if (ev.text && /[a-zA-Z_]/.test(ev.text[0])) {
+        var cur = ed.getCursor(), tok = ed.getTokenAt(cur);
+        if ((tok.string || "").length >= 2) {
+            CodeMirror.commands.autocomplete(ed, null, { completeSingle: false });
+        }
+    }
+});
 
 function getCode() { return cm.getValue(); }
 function setCode(s) {
@@ -614,7 +622,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def start_server():
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", 28350), Handler)
+    except OSError:
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     srv.studio = {
         "tree": None, "place": None, "seen": 0.0,
         "commands": queue.Queue(), "results": queue.Queue(),
