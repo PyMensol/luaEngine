@@ -1,4 +1,4 @@
-# luaEngine
+# lualite
 
 a mini visual-studio-ish editor for lua. runs actual lua 5.3 inside the app,
 talks to roblox studio over a local bridge, and has a dumb little mcp-ish
@@ -15,7 +15,7 @@ py -3.14 lua_engine.py
 ```
 
 first launch downloads codemirror + fengari (~400kb) into
-%LOCALAPPDATA%\LuaEngine\web-cache so it works offline after that.
+%LOCALAPPDATA%\LuaLite\web-cache so it works offline after that.
 
 ## what it looks like
 

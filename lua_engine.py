@@ -1,4 +1,4 @@
-"""luaEngine - a lua editor + sandboxed vm that runs in a local web page.
+"""lualite - a lua editor + sandboxed vm that runs in a local web page.
 
 run: py -3.14 lua_engine.py
 needs: PySide6
@@ -18,7 +18,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LuaEngine"
+APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LuaLite"
 CACHE = APP_DIR / "web-cache"
 CACHE.mkdir(parents=True, exist_ok=True)
 
@@ -42,7 +42,7 @@ ASSETS = {
     "fengari.js": "https://cdn.jsdelivr.net/npm/fengari-web@0.1.4/dist/fengari-web.min.js",
 }
 
-HELLO = '''-- hello from luaEngine
+HELLO = '''-- hello from lualite
 -- this is real lua 5.3 running on fengari
 
 local function greet(name)
@@ -120,15 +120,15 @@ end
 print = function(...) emit("out", ...) end
 warn = function(...) emit("warn", ...) end
 
-local _instmt = {}
-_instmt.__index = function(self, k)
+local _inst = {}
+_inst.__index = function(self, k)
     local kids = rawget(self, "__children")
     if kids and kids[k] then return kids[k] end
     local cls = rawget(self, "__class")
     if _services[k] then return _services[k] end
     error(k .. " is not a valid member of " .. tostring(rawget(self, "__class") or "?"), 2)
 end
-_instmt.__newindex = function(self, k, v)
+_inst.__newindex = function(self, k, v)
     if k == "Parent" then
         rawset(self, "__parent", v)
         if v ~= nil then
@@ -149,10 +149,10 @@ _instmt.__newindex = function(self, k, v)
     end
     rawset(self, k, v)
 end
-_instmt.__tostring = function(self) return rawget(self, "Name") or "Instance" end
+_inst.__tostring = function(self) return rawget(self, "Name") or "Instance" end
 
 local function makeinst(class, name)
-    local o = setmetatable({__class = class, Name = name or class, __children = {}}, _instmt)
+    local o = setmetatable({__class = class, Name = name or class, __children = {}}, _inst)
     o.GetFullName = function(self)
         local chain, cur = {}, self
         while cur do
@@ -231,9 +231,9 @@ Enum = setmetatable({}, {__index = function(_, cat)
 end})
 '''
 
-PLUGIN_LUA = r'''-- luaEngine studio bridge plugin
+PLUGIN_LUA = r'''-- lualite studio bridge plugin
 -- put this file in Roblox Studio's Plugins folder, restart studio,
--- then click "luaEngine" in the plugins toolbar.
+-- then it polls the app automatically.
 
 local HttpService = game:GetService("HttpService")
 local BASE = "http://127.0.0.1:PORT_HERE"
@@ -328,6 +328,13 @@ html, body { margin: 0; height: 100%; background: #1e1e1e; }
 .cm-builtin { color: #4ec9b0; }
 .cm-operator { color: #d4d4d4; }
 .cm-bracket { color: #ffd700; }
+.cm-meta { color: #c586c0; }
+.cm-attribute { color: #4ec9b0; }
+.cm-tag { color: #569cd6; }
+.cm-error-line { background: rgba(200, 60, 60, 0.18); }
+.CodeMirror-widget-errline {
+    border-bottom: 2px wavy #f14c4c;
+}
 .dialogdlg { position: absolute; left: 0; right: 0; background: #252526; z-index: 15;
     padding: 5px 10px; border-bottom: 1px solid #454545; font: 12px Segoe UI, sans-serif; }
 .dialogdlg input { background: #3c3c3c; border: 1px solid #555; color: #eee;
@@ -413,6 +420,35 @@ cm.on("inputRead", function(ed, ev) {
     }
 });
 
+var errMarks = [];
+var lintTimer = null;
+function lintNow() {
+    var code = cm.getValue();
+    if (!window.fengari || !code.trim()) { clearErr(); return; }
+    var lua = fengari.lua, lauxlib = fengari.lauxlib, to_luastring = fengari.to_luastring;
+    var L2 = lauxlib.luaL_newstate();
+    var st = lauxlib.luaL_loadstring(L2, to_luastring(code));
+    clearErr();
+    if (st !== lua.LUA_OK) {
+        var msg = fengari.to_jsstring(lua.lua_tostring(L2, -1));
+        var m = msg.match(/:(\d+):/);
+        var line = m ? parseInt(m[1], 10) - 1 : 0;
+        errMarks.push(cm.addLineClass(line, "background", "cm-error-line"));
+        if (bridge) bridge.lintResult(msg.replace(/^\[string "[^\]"]*"\]:/, "line"));
+    } else {
+        if (bridge) bridge.lintResult("");
+    }
+}
+function clearErr() {
+    for (var i = 0; i < errMarks.length; i++)
+        cm.removeLineClass(errMarks[i], "background", "cm-error-line");
+    errMarks = [];
+}
+cm.on("change", function() {
+    if (lintTimer) clearTimeout(lintTimer);
+    lintTimer = setTimeout(lintNow, 500);
+});
+
 function getCode() { return cm.getValue(); }
 function setCode(s) {
     suppressDirty = true;
@@ -421,13 +457,7 @@ function setCode(s) {
     cm.setCursor(0, 0);
     suppressDirty = false;
 }
-function setDirtyTitle(mark) {}
 function focusEditor() { cm.focus(); }
-
-function fmtErr(e) {
-    var s = String(e);
-    return s;
-}
 
 var L = null;
 function luaRun(code) {
@@ -472,7 +502,7 @@ new QWebChannel(qt.webChannelTransport, function(ch) {
     bridge.setPrelude.connect(function(s) { window.__prelude = s; });
     bridge.runCode.connect(function(code) {
         running = true; stopFlag = false;
-        try { luaRun(code); } catch (e) { bridge.output("err", fmtErr(e)); }
+        try { luaRun(code); } catch (e) { bridge.output("err", String(e)); }
         running = false;
         bridge.runFinished();
     });
@@ -496,7 +526,7 @@ def fetch_asset(name):
         return target.read_bytes()
     req = urllib.request.Request(
         ASSETS[name],
-        headers={"User-Agent": "Mozilla/5.0 (luaEngine asset fetch)"},
+        headers={"User-Agent": "Mozilla/5.0 (lualite)"},
     )
     with urllib.request.urlopen(req, timeout=30) as r:
         data = r.read()
@@ -639,7 +669,7 @@ def main():
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QSplitter, QTabWidget, QTextEdit,
         QFileDialog, QMessageBox, QToolBar, QWidget, QVBoxLayout, QLabel,
-        QDockWidget, QTreeWidget, QTreeWidgetItem,
+        QDockWidget, QTreeWidget, QTreeWidgetItem, QStyle,
     )
     from PySide6.QtGui import QAction, QFont, QKeySequence, QTextCursor, QColor
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -687,9 +717,38 @@ def main():
         def requestRun(self):
             self.wantRun.emit()
 
+        linted = Signal(str)
+
+        @Slot(str)
+        def lintResult(self, msg):
+            self.linted.emit(msg)
+
     app = QApplication(sys.argv[:1])
-    app.setApplicationName("luaEngine")
+    app.setApplicationName("LuaLite")
     app.setStyle("Fusion")
+    app.setStyleSheet("""
+        QMainWindow, QDockWidget { background: #252526; }
+        QMenuBar { background: #2d2d30; color: #ddd; border: 0; }
+        QMenuBar::item { padding: 4px 10px; background: transparent; }
+        QMenuBar::item:selected { background: #3e3e40; }
+        QMenu { background: #1b1b1c; color: #ddd; border: 1px solid #454545; }
+        QMenu::item:selected { background: #094771; }
+        QToolBar { background: #2d2d30; border: 0; spacing: 3px; padding: 2px; }
+        QToolButton { color: #ddd; background: transparent;
+            padding: 4px 8px; border: 1px solid transparent; }
+        QToolButton:hover { background: #3e3e40; border: 1px solid #555; }
+        QToolButton:pressed { background: #094771; }
+        QStatusBar { background: #007acc; color: #fff; }
+        QStatusBar QLabel { color: #fff; padding: 0 8px; }
+        QStatusBar::item { border: 0; }
+        QDockWidget { color: #ccc; font-weight: bold; }
+        QDockWidget::title { background: #252526; padding: 6px;
+            border-bottom: 1px solid #1e1e1e; }
+        QTreeWidget { background: #252526; color: #ccc; border: 0; }
+        QTreeWidget::item:hover { background: #2a2d2e; }
+        QTreeWidget::item:selected { background: #094771; color: #fff; }
+        QSplitter::handle { background: #1e1e1e; }
+    """)
 
     srv = start_server()
     port = srv.server_address[1]
@@ -704,7 +763,8 @@ def main():
     class Window(QMainWindow):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("luaEngine")
+            self.setWindowTitle("LuaLite")
+            self.setWindowIcon(self._lua_icon())
             self.resize(1100, 720)
             self.tabs = [EditorTab()]
             self.cur = 0
@@ -727,14 +787,25 @@ def main():
 
             split = QSplitter(Qt.Vertical)
             split.addWidget(self.view)
-            split.addWidget(self.output)
+            outbox = QWidget()
+            outlay = QVBoxLayout(outbox)
+            outlay.setContentsMargins(0, 0, 0, 0)
+            outlay.setSpacing(0)
+            hdr = QLabel("Output")
+            hdr.setStyleSheet("background:#2d2d30;color:#ccc;padding:3px 10px;"
+                              "font:11px 'Segoe UI';border-bottom:1px solid #1e1e1e;")
+            outlay.addWidget(hdr)
+            outlay.addWidget(self.output)
+            split.addWidget(outbox)
             split.setSizes([520, 160])
             self.setCentralWidget(split)
 
             self.status = self.statusBar()
             self.pos_lbl = QLabel("Ln 1, Col 1")
             self.vm_lbl = QLabel("Lua 5.3 (fengari)")
+            self.lint_lbl = QLabel("")
             self.status.addPermanentWidget(self.vm_lbl)
+            self.status.addPermanentWidget(self.lint_lbl)
             self.status.addPermanentWidget(self.pos_lbl)
             self.status.showMessage("loading editor...")
 
@@ -757,8 +828,28 @@ def main():
                 lambda l, c: self.pos_lbl.setText("Ln %d, Col %d" % (l, c)))
             self.bridge.dirty.connect(self._on_dirty)
             self.bridge.wantRun.connect(self.run)
+            self.bridge.linted.connect(
+                lambda m: self.lint_lbl.setText(m[:60] if m else ""))
 
             self.view.load(QUrl("http://127.0.0.1:%d/index.html" % port))
+
+        def _lua_icon(self):
+            from PySide6.QtGui import QPixmap, QPainter, QBrush, QIcon
+            px = QPixmap(64, 64)
+            px.fill(Qt.transparent)
+            p = QPainter(px)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setBrush(QBrush(QColor("#00007d")))
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(4, 4, 56, 56)
+            p.setBrush(QBrush(QColor("#ffffff")))
+            p.drawEllipse(34, 16, 20, 20)
+            p.setBrush(QBrush(QColor("#00007d")))
+            p.drawEllipse(30, 12, 20, 20)
+            p.setBrush(QBrush(QColor("#ffffff")))
+            p.drawEllipse(44, 40, 8, 8)
+            p.end()
+            return QIcon(px)
 
         def _menus(self):
             mb = self.menuBar()
@@ -786,7 +877,7 @@ def main():
 
             hm = mb.addMenu("&Help")
             self._act(hm, "About", lambda: QMessageBox.information(
-                self, "luaEngine",
+                self, "LuaLite",
                 "lua editor + real lua 5.3 vm (fengari) + codemirror\n"
                 "game api is a sandbox stub, nothing leaves your pc"))
 
@@ -802,20 +893,24 @@ def main():
             tb = QToolBar("main")
             tb.setMovable(False)
             self.addToolBar(tb)
-            for label, fn, tip in [
-                ("New", self.new_tab, "new file"),
-                ("Open", self.open_file, "open .lua"),
-                ("Save", self.save, "save"),
-                ("|", None, ""),
-                ("Run", self.run, "run the script (F5)"),
-                ("Studio", self.run_in_studio, "send the script to roblox studio"),
-                ("Stop", self.stop, "stop a running script"),
-                ("Clear", self.output.clear, "clear output"),
+            st = self.style()
+            for label, fn, tip, icon in [
+                ("New", self.new_tab, "new file", QStyle.SP_FileIcon),
+                ("Open", self.open_file, "open .lua", QStyle.SP_DialogOpenButton),
+                ("Save", self.save, "save", QStyle.SP_DialogSaveButton),
+                ("|", None, "", None),
+                ("Run", self.run, "run the script (F5)", QStyle.SP_MediaPlay),
+                ("Studio", self.run_in_studio,
+                 "send the script to roblox studio", QStyle.SP_ComputerIcon),
+                ("Stop", self.stop, "stop a running script", QStyle.SP_MediaStop),
+                ("Clear", self.output.clear,
+                 "clear output", QStyle.SP_TrashIcon),
             ]:
                 if label == "|":
                     tb.addSeparator()
                     continue
-                a = QAction(label, self)
+                a = QAction(self.style().standardIcon(
+                    icon or QStyle.SP_FileIcon), label, self)
                 a.setToolTip(tip)
                 a.triggered.connect(fn)
                 tb.addAction(a)
@@ -854,10 +949,13 @@ def main():
         def _fill_files(self):
             scripts = Path(__file__).parent / "scripts"
             scripts.mkdir(exist_ok=True)
+            st = self.style()
             root = QTreeWidgetItem(self.tree, ["workspace"])
+            root.setIcon(0, st.standardIcon(QStyle.SP_DirIcon))
             for p in sorted(scripts.rglob("*")):
                 if p.is_file() and p.suffix in (".lua", ".txt"):
                     it = QTreeWidgetItem(root, [p.name])
+                    it.setIcon(0, st.standardIcon(QStyle.SP_FileIcon))
                     it.setData(0, Qt.UserRole, str(p))
             root.setExpanded(True)
 
@@ -896,11 +994,18 @@ def main():
                 self.tree.takeTopLevelItem(
                     self.tree.indexOfTopLevelItem(self.studio_root))
             self.studio_root = QTreeWidgetItem(self.tree, ["roblox studio"])
+            self.studio_root.setIcon(
+                0, self.style().standardIcon(QStyle.SP_ComputerIcon))
             def fill(node, kids):
                 for e in kids:
                     it = QTreeWidgetItem(node, [e.get("name", "?")])
                     if e.get("source") is not None:
                         it.setData(0, Qt.UserRole + 1, e["source"])
+                        it.setIcon(0, self.style().standardIcon(
+                            QStyle.SP_FileIcon))
+                    elif e.get("children"):
+                        it.setIcon(0, self.style().standardIcon(
+                            QStyle.SP_DirIcon))
                     if e.get("children"):
                         fill(it, e["children"])
             fill(self.studio_root, tree)
@@ -920,7 +1025,7 @@ def main():
             src = PLUGIN_LUA.replace("PORT_HERE", str(srv.server_address[1]))
             plugins = Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "Plugins"
             plugins.mkdir(parents=True, exist_ok=True)
-            target = plugins / "luaengine_bridge.lua"
+            target = plugins / "lualite_bridge.lua"
             target.write_text(src, encoding="utf-8")
             QMessageBox.information(
                 self, "studio plugin",
