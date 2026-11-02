@@ -237,6 +237,7 @@ PLUGIN_LUA = r'''-- lualite studio bridge plugin
 
 local HttpService = game:GetService("HttpService")
 local BASE = "http://127.0.0.1:PORT_HERE"
+local SID = HttpService:GenerateGUID():sub(1, 8)
 
 local function post(path, data)
     return HttpService:PostAsync(BASE .. path,
@@ -272,13 +273,14 @@ local function send_tree()
                          children = tree(svc, 0)}
         end
     end
-    post("/studio/tree", {tree = t})
+    post("/studio/tree", {id = SID, tree = t})
 end
 
-post("/studio/hello", {place = game.Name ~= "" and game.Name or "untitled place"})
+post("/studio/hello", {id = SID,
+    place = game.Name ~= "" and game.Name or "untitled place"})
 
 while true do
-    local ok, body = pcall(get, "/studio/poll")
+    local ok, body = pcall(get, "/studio/poll?id=" .. SID)
     if ok and body and body ~= "" then
         local cmd = HttpService:JSONDecode(body)
         if cmd.type == "tree" then
@@ -292,7 +294,7 @@ while true do
             else
                 out = "load err: " .. tostring(err)
             end
-            post("/studio/result", {text = out})
+            post("/studio/result", {id = SID, text = out})
         end
     end
     task.wait(0.5)
@@ -561,8 +563,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
         elif path == "/studio/poll":
+            sid = ""
+            if "?" in self.path and "id=" in self.path:
+                sid = self.path.split("id=")[1].split("&")[0]
+            sess = self._session(sid)
             try:
-                cmd = self.server.studio["commands"].get_nowait()
+                cmd = sess["queue"].get_nowait()
             except queue.Empty:
                 self.send_response(204)
                 self.end_headers()
@@ -571,11 +577,11 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "application/json"
         elif path == "/studio/status":
             st = self.server.studio
-            body = json.dumps({
-                "connected": st["place"] is not None and
-                             time.time() - st["seen"] < 15,
-                "place": st["place"],
-            }).encode()
+            now = time.time()
+            body = json.dumps({"sessions": [
+                {"id": k, "place": s["place"],
+                 "alive": now - s["seen"] < 15}
+                for k, s in st["sessions"].items()]}).encode()
             ctype = "application/json"
         else:
             self.send_error(404)
@@ -598,22 +604,21 @@ class Handler(BaseHTTPRequestHandler):
         st = self.server.studio
 
         if path == "/studio/hello":
-            st["place"] = data.get("place", "?")
-            st["seen"] = time.time()
+            self._session(data.get("id", ""))["place"] = data.get("place", "?")
             out = {"ok": True}
         elif path == "/studio/tree":
-            st["tree"] = data.get("tree", [])
-            st["seen"] = time.time()
+            self._session(data.get("id", ""))["tree"] = data.get("tree", [])
             out = {"ok": True}
         elif path == "/studio/result":
             st["results"].put(data.get("text", ""))
-            st["seen"] = time.time()
+            self._session(data.get("id", ""))
             out = {"ok": True}
         elif path == "/studio/execute":
-            st["commands"].put({"type": "execute", "code": data.get("code", "")})
+            self._broadcast({"type": "execute", "code": data.get("code", "")},
+                            data.get("target"))
             out = {"ok": True}
         elif path == "/studio/ask-tree":
-            st["commands"].put({"type": "tree"})
+            self._broadcast({"type": "tree"}, data.get("target"))
             out = {"ok": True}
         elif path == "/mcp":
             out = self._mcp(data)
@@ -627,6 +632,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def _session(self, sid):
+        sid = sid or "default"
+        st = self.server.studio
+        if sid not in st["sessions"]:
+            st["sessions"][sid] = {
+                "place": "?", "seen": 0.0, "tree": None, "queue": queue.Queue()}
+        st["sessions"][sid]["seen"] = time.time()
+        return st["sessions"][sid]
+
+    def _broadcast(self, cmd, target=None):
+        st = self.server.studio
+        for sid, sess in st["sessions"].items():
+            if target in (None, "", "*", sid):
+                sess["queue"].put(dict(cmd))
 
     def _mcp(self, req):
         st = self.server.studio
@@ -642,12 +662,17 @@ class Handler(BaseHTTPRequestHandler):
         name = req.get("params", {}).get("name", "")
         args = req.get("params", {}).get("arguments", {})
         if name == "studio_tree":
-            return {"tree": st["tree"] or []}
+            trees = {k: s["tree"] for k, s in st["sessions"].items()
+                     if s["tree"] is not None}
+            return {"sessions": trees}
         if name == "studio_execute":
-            st["commands"].put({"type": "execute", "code": args.get("code", "")})
+            self._broadcast({"type": "execute", "code": args.get("code", "")},
+                            args.get("target"))
             return {"queued": True}
         if name == "editor_open":
-            return {"queued": False, "note": "open it yourself for now"}
+            st["ui"].put({"type": "open", "name": args.get("name", "ai.lua"),
+                          "content": args.get("content", "")})
+            return {"queued": True}
         return {"error": "no such tool"}
 
 
@@ -657,8 +682,7 @@ def start_server():
     except OSError:
         srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     srv.studio = {
-        "tree": None, "place": None, "seen": 0.0,
-        "commands": queue.Queue(), "results": queue.Queue(),
+        "sessions": {}, "results": queue.Queue(), "ui": queue.Queue(),
     }
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
@@ -851,6 +875,30 @@ def main():
             p.end()
             return QIcon(px)
 
+        def _icon(self, kind):
+            from PySide6.QtGui import QPixmap, QPainter, QPen, QIcon, QPolygon
+            from PySide6.QtCore import QPoint
+            px = QPixmap(16, 16)
+            px.fill(Qt.transparent)
+            p = QPainter(px)
+            p.setRenderHint(QPainter.Antialiasing)
+            if kind == "play":
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor("#89d185"))
+                p.drawPolygon(QPolygon([QPoint(4, 3), QPoint(13, 8), QPoint(4, 13)]))
+            elif kind == "stop":
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor("#f48771"))
+                p.drawRect(4, 4, 8, 8)
+            elif kind == "monitor":
+                p.setPen(QPen(QColor("#ddd"), 1.4))
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(2, 3, 12, 8)
+                p.drawLine(8, 11, 8, 14)
+                p.drawLine(5, 14, 11, 14)
+            p.end()
+            return QIcon(px)
+
         def _menus(self):
             mb = self.menuBar()
             fm = mb.addMenu("&File")
@@ -899,18 +947,19 @@ def main():
                 ("Open", self.open_file, "open .lua", QStyle.SP_DialogOpenButton),
                 ("Save", self.save, "save", QStyle.SP_DialogSaveButton),
                 ("|", None, "", None),
-                ("Run", self.run, "run the script (F5)", QStyle.SP_MediaPlay),
+                ("Run", self.run, "run the script (F5)", "play"),
                 ("Studio", self.run_in_studio,
-                 "send the script to roblox studio", QStyle.SP_ComputerIcon),
-                ("Stop", self.stop, "stop a running script", QStyle.SP_MediaStop),
+                 "send the script to roblox studio", "monitor"),
+                ("Stop", self.stop, "stop a running script", "stop"),
                 ("Clear", self.output.clear,
                  "clear output", QStyle.SP_TrashIcon),
             ]:
                 if label == "|":
                     tb.addSeparator()
                     continue
-                a = QAction(self.style().standardIcon(
-                    icon or QStyle.SP_FileIcon), label, self)
+                ic = (self._icon(icon) if isinstance(icon, str)
+                      else self.style().standardIcon(icon or QStyle.SP_FileIcon))
+                a = QAction(ic, label, self)
                 a.setToolTip(tip)
                 a.triggered.connect(fn)
                 tb.addAction(a)
@@ -940,23 +989,88 @@ def main():
             self.tree = QTreeWidget()
             self.tree.setHeaderHidden(True)
             self.tree.itemDoubleClicked.connect(self._tree_open)
+            self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.tree.customContextMenuRequested.connect(self._tree_menu)
             dock = QDockWidget("Explorer", self)
             dock.setObjectName("explorer")
             dock.setWidget(self.tree)
             self.addDockWidget(Qt.LeftDockWidgetArea, dock)
             self._fill_files()
 
+        def _ws_dir(self):
+            d = Path(__file__).parent / "scripts"
+            d.mkdir(exist_ok=True)
+            return d
+
+        def _tree_menu(self, pos):
+            from PySide6.QtWidgets import QMenu, QInputDialog
+            item = self.tree.itemAt(pos)
+            menu = QMenu(self)
+            is_ws = item is None or self._in_workspace(item)
+            if is_ws:
+                menu.addAction("new file", lambda: self._mk_file())
+                menu.addAction("new folder", lambda: self._mk_folder())
+            if item and isinstance(item.data(0, Qt.UserRole), str):
+                menu.addSeparator()
+                menu.addAction("delete", lambda: self._del_file(item))
+            menu.addAction("refresh", lambda: self._fill_files())
+            menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+        def _in_workspace(self, item):
+            while item.parent():
+                item = item.parent()
+            return item.text(0) == "workspace"
+
+        def _mk_file(self):
+            from PySide6.QtWidgets import QInputDialog
+            name, ok = QInputDialog.getText(self, "new file", "name:")
+            if not ok or not name.strip():
+                return
+            name = name.strip()
+            if "." not in name:
+                name += ".lua"
+            p = self._ws_dir() / name
+            p.write_text("", encoding="utf-8")
+            self._fill_files()
+            self._open_tab(p.name, "", str(p))
+
+        def _mk_folder(self):
+            from PySide6.QtWidgets import QInputDialog
+            name, ok = QInputDialog.getText(self, "new folder", "name:")
+            if ok and name.strip():
+                (self._ws_dir() / name.strip()).mkdir(exist_ok=True)
+                self._fill_files()
+
+        def _del_file(self, item):
+            p = Path(item.data(0, Qt.UserRole))
+            if p.is_file():
+                p.unlink()
+            elif p.is_dir():
+                import shutil
+                shutil.rmtree(p)
+            self._fill_files()
+
         def _fill_files(self):
-            scripts = Path(__file__).parent / "scripts"
-            scripts.mkdir(exist_ok=True)
+            scripts = self._ws_dir()
             st = self.style()
+            old = self.tree.findItems("workspace", Qt.MatchExactly, 0)
+            if old:
+                self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(old[0]))
             root = QTreeWidgetItem(self.tree, ["workspace"])
             root.setIcon(0, st.standardIcon(QStyle.SP_DirIcon))
-            for p in sorted(scripts.rglob("*")):
-                if p.is_file() and p.suffix in (".lua", ".txt"):
-                    it = QTreeWidgetItem(root, [p.name])
-                    it.setIcon(0, st.standardIcon(QStyle.SP_FileIcon))
-                    it.setData(0, Qt.UserRole, str(p))
+            self.tree.insertTopLevelItem(0, root)
+            def walk(parent, d):
+                for p in sorted(d.iterdir()):
+                    if p.is_dir():
+                        it = QTreeWidgetItem(parent, [p.name])
+                        it.setIcon(0, st.standardIcon(QStyle.SP_DirIcon))
+                        it.setData(0, Qt.UserRole, str(p))
+                        walk(it, p)
+                    elif p.suffix in (".lua", ".txt"):
+                        it = QTreeWidgetItem(parent, [p.name])
+                        it.setIcon(0, st.standardIcon(QStyle.SP_FileIcon))
+                        it.setData(0, Qt.UserRole, str(p))
+            walk(root, scripts)
             root.setExpanded(True)
 
         def _tree_open(self, item, col):
@@ -982,43 +1096,75 @@ def main():
                 except queue.Empty:
                     break
                 self._println("ok", "[studio] " + str(text))
-            alive = st["place"] is not None and time.time() - st["seen"] < 15
+            while True:
+                try:
+                    act = st["ui"].get_nowait()
+                except queue.Empty:
+                    break
+                if act.get("type") == "open":
+                    p = self._ws_dir() / Path(act["name"]).name
+                    p.write_text(act.get("content", ""), encoding="utf-8")
+                    self._fill_files()
+                    self._open_tab(p.name, act.get("content", ""), str(p))
+            now = time.time()
+            alive = {k: s for k, s in st["sessions"].items()
+                     if now - s["seen"] < 15}
+            names = [s["place"] for s in alive.values()]
             self.studio_lbl.setText(
-                "studio: %s" % st["place"] if alive else "studio: not connected")
-            if st["tree"] is not None and st["tree"] is not getattr(self, "_last_tree", None):
-                self._last_tree = st["tree"]
-                self._fill_studio(st["tree"])
+                "studio: %s" % ", ".join(names) if names
+                else "studio: not connected")
+            ver = sum(id(s["tree"]) for s in st["sessions"].values())
+            if ver != getattr(self, "_tree_ver", -1):
+                self._tree_ver = ver
+                self._fill_studio(alive)
 
-        def _fill_studio(self, tree):
+        def _fill_studio(self, sessions):
             if self.studio_root is not None:
                 self.tree.takeTopLevelItem(
                     self.tree.indexOfTopLevelItem(self.studio_root))
+                self.studio_root = None
+            if not sessions:
+                return
+            st = self.style()
             self.studio_root = QTreeWidgetItem(self.tree, ["roblox studio"])
             self.studio_root.setIcon(
-                0, self.style().standardIcon(QStyle.SP_ComputerIcon))
+                0, st.standardIcon(QStyle.SP_ComputerIcon))
             def fill(node, kids):
                 for e in kids:
                     it = QTreeWidgetItem(node, [e.get("name", "?")])
                     if e.get("source") is not None:
                         it.setData(0, Qt.UserRole + 1, e["source"])
-                        it.setIcon(0, self.style().standardIcon(
-                            QStyle.SP_FileIcon))
+                        it.setIcon(0, st.standardIcon(QStyle.SP_FileIcon))
                     elif e.get("children"):
-                        it.setIcon(0, self.style().standardIcon(
-                            QStyle.SP_DirIcon))
+                        it.setIcon(0, st.standardIcon(QStyle.SP_DirIcon))
                     if e.get("children"):
                         fill(it, e["children"])
-            fill(self.studio_root, tree)
+            for sid, sess in sessions.items():
+                place = QTreeWidgetItem(
+                    self.studio_root, ["%s (%s)" % (sess["place"], sid)])
+                place.setIcon(0, st.standardIcon(QStyle.SP_ComputerIcon))
+                if sess["tree"]:
+                    fill(place, sess["tree"])
             self.studio_root.setExpanded(True)
 
+        def _to_studio(self, cmd):
+            now = time.time()
+            n = 0
+            for sess in srv.studio["sessions"].values():
+                if now - sess["seen"] < 15:
+                    sess["queue"].put(dict(cmd))
+                    n += 1
+            if n == 0:
+                self._println("warn", "[studio] nothing connected - "
+                                      "open studio with the plugin")
+
         def ask_tree(self):
-            srv.studio["commands"].put({"type": "tree"})
+            self._to_studio({"type": "tree"})
             self.status.showMessage("asked studio for the file tree...", 3000)
 
         def run_in_studio(self):
-            code = self.tabs[self.cur].text
-            self._pull_code(lambda c: srv.studio["commands"].put(
-                {"type": "execute", "code": c}))
+            self._pull_code(
+                lambda c: self._to_studio({"type": "execute", "code": c}))
             self._println("warn", "[studio] queued, waiting for plugin...")
 
         def install_plugin(self):
