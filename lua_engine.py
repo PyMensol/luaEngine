@@ -1,13 +1,3 @@
-"""lualite - a lua editor + sandboxed vm that runs in a local web page.
-
-run: py -3.14 lua_engine.py
-needs: PySide6
-
-the editor page is CodeMirror and the lua vm is Fengari (real lua 5.3 in js),
-both fetched once from cdnjs into a local cache. a tiny http server on
-127.0.0.1 serves everything so the page has a real origin.
-"""
-
 import json
 import os
 import sys
