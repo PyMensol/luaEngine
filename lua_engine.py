@@ -99,6 +99,7 @@ print("after: ", table.concat(nums, " "))
 
 PRELUDE = r'''
 local _printed = 0
+-- fengari eats the first arg on method calls so the nil is a dummy
 local function emit(kind, ...)
     local parts = {}
     for i = 1, select("#", ...) do
@@ -129,6 +130,7 @@ _inst.__newindex = function(self, k, v)
         return
     end
     if k == "Name" then
+        -- rename = reindex under the parent, spent ages on this
         local p = rawget(self, "__parent")
         if p and rawget(p, "__children") then
             rawget(p, "__children")[rawget(self, "Name")] = nil
